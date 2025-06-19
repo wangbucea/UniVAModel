@@ -183,7 +183,7 @@ class DualViewDINOv2VisualEncoder(nn.Module):
             fused_features = (fused_features_1 + fused_features_2) / 2
             
             # 残差连接和投影
-            fused_features = self.layer_norm(fused_features + (view1_features + view2_features) / 2)
+            fused_features = self.layer_norm(fused_features)
             fused_features = self.fusion_projection(fused_features)
             
             fused_Vfeatures_list.append(fused_features)
@@ -762,7 +762,7 @@ class RobotUniADModel224(nn.Module):
                  action_dim=7,
                  seq_len=30,
                  feature_dim=256,
-                 image_size=(224, 224),  # 修改为224x224
+                 image_size=(224, 224),
                  use_markov_regularizer=True,
                  markov_weight=0.1,
                  use_dual_view=True):
@@ -785,7 +785,7 @@ class RobotUniADModel224(nn.Module):
             num_point_queries=num_points,
             num_seg_classes=num_seg_classes,
             num_det_classes=num_det_classes,
-            image_size=image_size  # 传递224x224
+            image_size=image_size
         )
         
         # 4. 动作轨迹模型
@@ -793,8 +793,8 @@ class RobotUniADModel224(nn.Module):
             action_dim=action_dim,
             seq_len=seq_len,
             hidden_size=512,
-            depth=12,
-            num_heads=16,
+            depth=6,
+            num_heads=8,
             feature_dim=feature_dim,
             num_classes=1000,
             learn_sigma=True,
