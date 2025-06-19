@@ -1,513 +1,595 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 import cv2
 from PIL import Image
 import os
-from typing import List, Tuple, Dict, Optional
-import seaborn as sns
+from typing import List, Tuple, Optional, Dict, Any
+import math
 from VLAModel import DualViewDINOv2VisualEncoder, DINOv2VisualEncoder
-from vla_dataset_loader import create_vla_dataloader
-import torchvision.transforms as transforms
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+from vla_dataset_loader import VLADatasetLoader
 
-class DINOv2FeatureVisualizer:
+class VLADINOv2Visualizer:
     """
-    DINOv2物体特征可视化器
-    专门用于提取和可视化DINOv2模型识别的物体特征
+    VLA模型中DINOv2模块的特征可视化工具
+    支持单视角和双视角DINOv2编码器的特征热力图生成
     """
     
     def __init__(self, 
-                 model_name: str = "facebook/dinov2-base",
-                 dataset_path: str = None,
-                 device: str = 'cuda',
-                 use_dual_view: bool = True,
-                 image_size: Tuple[int, int] = (224, 224)):
+                 encoder_type='single',  # 'single' or 'dual'
+                 model_name="facebook/dinov2-base",
+                 device='cuda' if torch.cuda.is_available() else 'cpu',
+                 image_size=(480, 640)):
         """
-        初始化DINOv2特征可视化器
+        初始化VLA DINOv2可视化器
         
         Args:
+            encoder_type: 编码器类型，'single'表示DINOv2VisualEncoder，'dual'表示DualViewDINOv2VisualEncoder
             model_name: DINOv2模型名称
-            dataset_path: 数据集路径
             device: 计算设备
-            use_dual_view: 是否使用双视角模式
-            image_size: 图像尺寸
+            image_size: 图像尺寸 (height, width)
         """
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.model_name = model_name
-        self.dataset_path = dataset_path
-        self.use_dual_view = use_dual_view
+        self.device = device
+        self.encoder_type = encoder_type
         self.image_size = image_size
         
-        # 初始化DINOv2编码器
-        self.visual_encoder = self._init_visual_encoder()
-        
-        # 初始化数据加载器（如果提供了数据集路径）
-        self.dataloader = None
-        if dataset_path:
-            self.dataloader = self._init_dataloader()
-        
-        # 创建输出目录
-        self.output_dir = "dinov2_feature_visualization"
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        # 存储提取的特征
-        self.features = {}
-        self._register_hooks()
-    
-    def _init_visual_encoder(self):
-        """初始化视觉编码器"""
-        if self.use_dual_view:
-            encoder = DualViewDINOv2VisualEncoder(
-                model_name=self.model_name,
+        # 初始化对应的编码器
+        if encoder_type == 'single':
+            self.visual_encoder = DINOv2VisualEncoder(
+                model_name=model_name,
                 freeze_backbone=False,
-                image_size=self.image_size
-            )
+                image_size=image_size
+            ).to(device)
+        elif encoder_type == 'dual':
+            self.visual_encoder = DualViewDINOv2VisualEncoder(
+                model_name=model_name,
+                freeze_backbone=False,
+                image_size=image_size
+            ).to(device)
         else:
-            encoder = DINOv2VisualEncoder(
-                model_name=self.model_name,
-                freeze_backbone=False,
-                image_size=self.image_size
-            )
+            raise ValueError("encoder_type must be 'single' or 'dual'")
         
-        encoder.to(self.device)
-        encoder.eval()
-        return encoder
-    
-    def _init_dataloader(self):
-        """初始化数据加载器"""
-        transform = transforms.Compose([
-            transforms.Resize(self.image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        self.visual_encoder.eval()
         
-        dataloader = create_vla_dataloader(
-            dataset_path=self.dataset_path,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            transform=transform,
-            sequence_length=5,
-            stride=1
-        )
-        return dataloader
+        # 存储中间特征的钩子
+        self.features = {}
+        self.hooks = []
+        
+        # 图像预处理参数
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
     
-    def _register_hooks(self):
+    def register_hooks(self):
         """注册钩子函数以提取中间特征"""
         def get_activation(name):
             def hook(model, input, output):
                 if hasattr(output, 'last_hidden_state'):
+                    # DINOv2模型输出
                     self.features[name] = output.last_hidden_state.detach()
-                elif isinstance(output, tuple) and len(output) > 0:
-                    if hasattr(output[0], 'detach'):
-                        self.features[name] = output[0].detach()
-                elif hasattr(output, 'detach'):
+                else:
                     self.features[name] = output.detach()
             return hook
         
-        # 注册不同模式的钩子
-        if self.use_dual_view:
-            self.visual_encoder.dinov2_view1.register_forward_hook(
-                get_activation('dinov2_view1_raw')
+        # 清除之前的钩子
+        self.clear_hooks()
+        
+        if self.encoder_type == 'single':
+            # 单视角编码器的钩子
+            self.hooks.append(
+                self.visual_encoder.dinov2.register_forward_hook(
+                    get_activation('dinov2_output')
+                )
             )
-            self.visual_encoder.dinov2_view2.register_forward_hook(
-                get_activation('dinov2_view2_raw')
+            self.hooks.append(
+                self.visual_encoder.feature_adapter.register_forward_hook(
+                    get_activation('adapted_features')
+                )
             )
-            self.visual_encoder.feature_adapter_view1.register_forward_hook(
-                get_activation('adapted_view1')
+        elif self.encoder_type == 'dual':
+            # 双视角编码器的钩子
+            self.hooks.append(
+                self.visual_encoder.dinov2_view1.register_forward_hook(
+                    get_activation('dinov2_view1_output')
+                )
             )
-            self.visual_encoder.feature_adapter_view2.register_forward_hook(
-                get_activation('adapted_view2')
+            self.hooks.append(
+                self.visual_encoder.dinov2_view2.register_forward_hook(
+                    get_activation('dinov2_view2_output')
+                )
             )
-        else:
-            self.visual_encoder.dinov2.register_forward_hook(
-                get_activation('dinov2_raw')
+            self.hooks.append(
+                self.visual_encoder.feature_adapter_view1.register_forward_hook(
+                    get_activation('adapted_features_view1')
+                )
             )
-            self.visual_encoder.feature_adapter.register_forward_hook(
-                get_activation('adapted_features')
+            self.hooks.append(
+                self.visual_encoder.feature_adapter_view2.register_forward_hook(
+                    get_activation('adapted_features_view2')
+                )
+            )
+            self.hooks.append(
+                self.visual_encoder.view_fusion.register_forward_hook(
+                    get_activation('fused_features')
+                )
             )
     
-    def _denormalize_image(self, tensor_image):
-        """反归一化图像用于可视化"""
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        
-        if tensor_image.is_cuda:
-            mean = mean.cuda()
-            std = std.cuda()
-        
-        denorm_image = tensor_image * std + mean
+    def clear_hooks(self):
+        """清除所有钩子"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+        self.features = {}
+    
+    def denormalize_image(self, tensor_image):
+        """反归一化图像用于显示"""
+        denorm_image = tensor_image * self.std + self.mean
         denorm_image = torch.clamp(denorm_image, 0, 1)
         return denorm_image
     
-    def _extract_object_features(self, features, method='attention', top_k=5):
+    def extract_patch_features(self, images):
         """
-        从DINOv2特征中提取物体相关的特征
+        提取patch级别的特征
         
         Args:
-            features: [B, N, C] DINOv2特征
-            method: 提取方法 ('attention', 'clustering', 'pca')
-            top_k: 提取的top-k特征数量
+            images: 输入图像，格式根据encoder_type而定
+                   - single: [B, T, C, H, W]
+                   - dual: [images_view1, images_view2] 每个都是 [B, T, C, H, W]
         
         Returns:
-            object_features: 物体相关特征
-            attention_weights: 注意力权重
+            features_dict: 包含各层特征的字典
         """
-        B, N, C = features.shape
-        features_np = features[0].cpu().numpy()  # 取第一个batch
+        self.register_hooks()
         
-        if method == 'attention':
-            # 使用自注意力机制识别重要区域
-            attention_scores = torch.matmul(features[0], features[0].transpose(-2, -1))  # [N, N]
-            attention_weights = torch.softmax(attention_scores.mean(dim=1), dim=0)  # [N]
-            
-            # 选择top-k最重要的patch
-            top_indices = torch.topk(attention_weights, top_k).indices
-            object_features = features[0][top_indices]  # [top_k, C]
-            
-        elif method == 'clustering':
-            # 使用K-means聚类识别物体区域
-            kmeans = KMeans(n_clusters=top_k, random_state=42)
-            cluster_labels = kmeans.fit_predict(features_np)
-            
-            # 计算每个cluster的中心特征
-            object_features = []
-            attention_weights = torch.zeros(N)
-            
-            for i in range(top_k):
-                cluster_mask = cluster_labels == i
-                if cluster_mask.sum() > 0:
-                    cluster_features = features_np[cluster_mask]
-                    cluster_center = cluster_features.mean(axis=0)
-                    object_features.append(cluster_center)
-                    attention_weights[cluster_mask] = 1.0 / cluster_mask.sum()
-            
-            object_features = torch.tensor(np.array(object_features), device=features.device)
-            
-        elif method == 'pca':
-            # 使用PCA降维并识别主要成分
-            pca = PCA(n_components=min(top_k, C))
-            pca_features = pca.fit_transform(features_np)
-            
-            # 计算每个patch在主成分上的投影强度
-            projection_strength = np.abs(pca_features).sum(axis=1)
-            top_indices = np.argsort(projection_strength)[-top_k:]
-            
-            object_features = features[0][top_indices]
-            attention_weights = torch.zeros(N)
-            attention_weights[top_indices] = torch.tensor(projection_strength[top_indices])
-            attention_weights = attention_weights / attention_weights.sum()
+        with torch.no_grad():
+            if self.encoder_type == 'single':
+                # 单视角处理
+                Vfeatures_list, spatial_shapes, level_start_index, valid_ratios = self.visual_encoder(images)
+            else:
+                # 双视角处理
+                Vfeatures_list, spatial_shapes, level_start_index, valid_ratios = self.visual_encoder(images)
         
-        return object_features, attention_weights
+        return {
+            'intermediate_features': self.features.copy(),
+            'output_features': Vfeatures_list,
+            'spatial_shapes': spatial_shapes,
+            'level_start_index': level_start_index
+        }
     
-    def _create_object_heatmap(self, attention_weights, spatial_shape=(16, 16)):
+    def create_attention_heatmap(self, features, patch_h, patch_w, method='mean'):
         """
-        根据注意力权重创建物体热力图
+        从patch特征创建注意力热力图
         
         Args:
-            attention_weights: [N] 注意力权重
-            spatial_shape: 空间形状
+            features: [B, N, D] patch特征
+            patch_h, patch_w: patch的空间维度
+            method: 聚合方法 ('mean', 'max', 'norm')
         
         Returns:
-            heatmap: [H, W] 热力图
+            heatmap: [B, patch_h, patch_w] 热力图
         """
-        H, W = spatial_shape
-        N = attention_weights.shape[0]
+        B, N, D = features.shape
         
-        # 确保权重数量与空间大小匹配
-        if N != H * W:
-            # 如果不匹配，进行插值调整
-            current_h = current_w = int(np.sqrt(N))
-            if current_h * current_w != N:
-                # 截断到最接近的平方数
-                current_h = current_w = int(np.sqrt(N))
-                attention_weights = attention_weights[:current_h*current_w]
-            
-            # 重塑并插值到目标尺寸
-            heatmap = attention_weights.view(current_h, current_w).cpu().numpy()
-            heatmap = cv2.resize(heatmap, (W, H), interpolation=cv2.INTER_LINEAR)
+        if method == 'mean':
+            # 对特征维度求平均
+            attention_scores = features.mean(dim=-1)  # [B, N]
+        elif method == 'max':
+            # 取特征维度的最大值
+            attention_scores = features.max(dim=-1)[0]  # [B, N]
+        elif method == 'norm':
+            # 使用L2范数
+            attention_scores = torch.norm(features, dim=-1)  # [B, N]
         else:
-            heatmap = attention_weights.view(H, W).cpu().numpy()
+            raise ValueError("method must be 'mean', 'max', or 'norm'")
         
-        # 归一化到0-1范围
-        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        # 重塑为空间维度
+        if N == patch_h * patch_w:
+            heatmap = attention_scores.view(B, patch_h, patch_w)
+        else:
+            # 如果patch数量不匹配，进行截断或填充
+            target_N = patch_h * patch_w
+            if N > target_N:
+                attention_scores = attention_scores[:, :target_N]
+            else:
+                padding = torch.zeros(B, target_N - N, device=features.device)
+                attention_scores = torch.cat([attention_scores, padding], dim=1)
+            heatmap = attention_scores.view(B, patch_h, patch_w)
         
         return heatmap
     
-    def _overlay_heatmap_on_image(self, image, heatmap, alpha=0.6, colormap=cv2.COLORMAP_JET):
+    def overlay_heatmap_on_image(self, image, heatmap, alpha=0.6, colormap='jet'):
         """
         将热力图叠加到原始图像上
         
         Args:
-            image: 原始图像 [H, W, 3]
-            heatmap: 特征热力图 [H, W]
+            image: [H, W, 3] 原始图像 (numpy array, 0-1范围)
+            heatmap: [H, W] 热力图 (numpy array)
             alpha: 热力图透明度
             colormap: 颜色映射
         
         Returns:
-            overlayed_image: 叠加后的图像
+            overlay_image: [H, W, 3] 叠加后的图像
         """
-        # 确保图像和热力图尺寸匹配
-        if image.shape[:2] != heatmap.shape:
-            heatmap = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
+        # 归一化热力图
+        heatmap_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         
-        # 将热力图转换为彩色图像
-        heatmap_colored = cv2.applyColorMap((heatmap * 255).astype(np.uint8), colormap)
-        heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+        # 应用颜色映射
+        cmap = plt.get_cmap(colormap)
+        heatmap_colored = cmap(heatmap_norm)[:, :, :3]  # 移除alpha通道
         
-        # 归一化图像到0-255范围
-        if image.max() <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = image.astype(np.uint8)
+        # 叠加图像
+        overlay_image = (1 - alpha) * image + alpha * heatmap_colored
         
-        # 叠加热力图
-        overlayed = cv2.addWeighted(image, 1-alpha, heatmap_colored, alpha, 0)
-        
-        return overlayed
+        return np.clip(overlay_image, 0, 1)
     
-    def visualize_object_features(self, 
-                                 images: torch.Tensor,
-                                 save_path: str = None,
-                                 extraction_methods: List[str] = ['attention', 'clustering'],
-                                 top_k: int = 5,
-                                 alpha: float = 0.6):
+    def visualize_features_from_dataset(self, 
+                                      dataset_path,
+                                      sample_idx=0,
+                                      time_step=0,
+                                      save_dir='./vla_dinov2_visualizations',
+                                      methods=['mean', 'norm']):
         """
-        可视化DINOv2提取的物体特征
+        从数据集中可视化特征
         
         Args:
-            images: 输入图像 [B, T, C, H, W] 或 List[[B, T, C, H, W]] (双视角)
-            save_path: 保存路径
-            extraction_methods: 特征提取方法列表
-            top_k: 提取的top-k特征数量
-            alpha: 热力图透明度
-        """
-        # 清空之前的特征
-        self.features.clear()
-        
-        # 前向传播提取特征
-        with torch.no_grad():
-            if self.use_dual_view:
-                if not isinstance(images, list) or len(images) != 2:
-                    raise ValueError("双视角模式需要提供两个视角的图像")
-                outputs = self.visual_encoder(images)
-            else:
-                if isinstance(images, list):
-                    images = images[0]  # 取第一个视角
-                outputs = self.visual_encoder(images)
-        
-        # 准备原始图像用于可视化
-        if self.use_dual_view:
-            original_images = []
-            for view_idx in range(2):
-                img = self._denormalize_image(images[view_idx][0, 0])  # 取第一帧
-                img = img.permute(1, 2, 0).cpu().numpy()
-                original_images.append(img)
-        else:
-            img = self._denormalize_image(images[0, 0])  # 取第一帧
-            original_images = [img.permute(1, 2, 0).cpu().numpy()]
-        
-        # 创建可视化
-        num_methods = len(extraction_methods)
-        num_views = 2 if self.use_dual_view else 1
-        
-        fig, axes = plt.subplots(num_methods + 1, num_views * 2, 
-                                figsize=(num_views * 8, (num_methods + 1) * 4))
-        
-        if num_methods == 1:
-            axes = axes.reshape(num_methods + 1, -1)
-        
-        fig.suptitle('DINOv2 Object Feature Visualization', fontsize=16)
-        
-        # 显示原始图像
-        for view_idx in range(num_views):
-            axes[0, view_idx * 2].imshow(original_images[view_idx])
-            axes[0, view_idx * 2].set_title(f'Original Image View {view_idx + 1}')
-            axes[0, view_idx * 2].axis('off')
-            
-            # 空白第二列
-            axes[0, view_idx * 2 + 1].axis('off')
-        
-        # 对每种提取方法进行可视化
-        for method_idx, method in enumerate(extraction_methods):
-            if self.use_dual_view:
-                # 双视角模式
-                for view_idx in range(2):
-                    feature_key = f'dinov2_view{view_idx + 1}_raw'
-                    if feature_key in self.features:
-                        features = self.features[feature_key]
-                        # 移除CLS token
-                        patch_features = features[:, 1:, :]
-                        
-                        # 提取物体特征
-                        object_features, attention_weights = self._extract_object_features(
-                            patch_features, method=method, top_k=top_k
-                        )
-                        
-                        # 创建热力图
-                        heatmap = self._create_object_heatmap(attention_weights)
-                        
-                        # 显示纯热力图
-                        im = axes[method_idx + 1, view_idx * 2].imshow(
-                            heatmap, cmap='viridis', interpolation='bilinear'
-                        )
-                        axes[method_idx + 1, view_idx * 2].set_title(
-                            f'{method.capitalize()} Heatmap View {view_idx + 1}'
-                        )
-                        axes[method_idx + 1, view_idx * 2].axis('off')
-                        plt.colorbar(im, ax=axes[method_idx + 1, view_idx * 2], 
-                                   fraction=0.046, pad=0.04)
-                        
-                        # 显示叠加图像
-                        overlayed = self._overlay_heatmap_on_image(
-                            original_images[view_idx], heatmap, alpha=alpha
-                        )
-                        axes[method_idx + 1, view_idx * 2 + 1].imshow(overlayed)
-                        axes[method_idx + 1, view_idx * 2 + 1].set_title(
-                            f'{method.capitalize()} Overlay View {view_idx + 1}'
-                        )
-                        axes[method_idx + 1, view_idx * 2 + 1].axis('off')
-            else:
-                # 单视角模式
-                feature_key = 'dinov2_raw'
-                if feature_key in self.features:
-                    features = self.features[feature_key]
-                    # 移除CLS token
-                    patch_features = features[:, 1:, :]
-                    
-                    # 提取物体特征
-                    object_features, attention_weights = self._extract_object_features(
-                        patch_features, method=method, top_k=top_k
-                    )
-                    
-                    # 创建热力图
-                    heatmap = self._create_object_heatmap(attention_weights)
-                    
-                    # 显示纯热力图
-                    im = axes[method_idx + 1, 0].imshow(
-                        heatmap, cmap='viridis', interpolation='bilinear'
-                    )
-                    axes[method_idx + 1, 0].set_title(f'{method.capitalize()} Heatmap')
-                    axes[method_idx + 1, 0].axis('off')
-                    plt.colorbar(im, ax=axes[method_idx + 1, 0], fraction=0.046, pad=0.04)
-                    
-                    # 显示叠加图像
-                    overlayed = self._overlay_heatmap_on_image(
-                        original_images[0], heatmap, alpha=alpha
-                    )
-                    axes[method_idx + 1, 1].imshow(overlayed)
-                    axes[method_idx + 1, 1].set_title(f'{method.capitalize()} Overlay')
-                    axes[method_idx + 1, 1].axis('off')
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"可视化结果已保存到: {save_path}")
-        else:
-            plt.show()
-        
-        plt.close()
-    
-    def visualize_from_dataset(self, sample_idx: int = 0, **kwargs):
-        """
-        从数据集中可视化指定样本的物体特征
-        
-        Args:
+            dataset_path: 数据集路径
             sample_idx: 样本索引
-            **kwargs: 传递给visualize_object_features的其他参数
+            time_step: 时间步索引
+            save_dir: 保存目录
+            methods: 特征聚合方法列表
         """
-        if self.dataloader is None:
-            raise ValueError("未提供数据集路径，无法从数据集加载样本")
+        # 创建保存目录
+        os.makedirs(save_dir, exist_ok=True)
         
-        # 获取指定样本
-        for i, batch in enumerate(self.dataloader):
+        # 加载数据
+        dataset_loader = VLADatasetLoader(
+            data_dir=dataset_path,
+            batch_size=1,
+            image_size=self.image_size,
+            num_workers=0
+        )
+        
+        dataloader = dataset_loader.get_dataloader()
+        
+        # 获取样本
+        for i, batch in enumerate(dataloader):
             if i == sample_idx:
                 break
         else:
-            raise IndexError(f"样本索引 {sample_idx} 超出数据集范围")
+            raise ValueError(f"Sample index {sample_idx} not found in dataset")
         
-        # 准备输入图像
-        if self.use_dual_view:
-            images = [
-                batch['chest_images'].to(self.device),
-                batch['head_images'].to(self.device)
-            ]
+        if self.encoder_type == 'single':
+            images = batch['images'].to(self.device)  # [B, T, C, H, W]
+            self._visualize_single_view(images, time_step, save_dir, methods)
         else:
-            images = batch['chest_images'].to(self.device)
-        
-        # 设置保存路径
-        save_path = os.path.join(self.output_dir, f"sample_{sample_idx}_object_features.png")
-        
-        # 可视化
-        self.visualize_object_features(images, save_path=save_path, **kwargs)
+            images_view1 = batch['images_view1'].to(self.device)
+            images_view2 = batch['images_view2'].to(self.device)
+            images = [images_view1, images_view2]
+            self._visualize_dual_view(images, time_step, save_dir, methods)
     
-    def visualize_from_image_paths(self, 
-                                  image_paths: List[str],
-                                  **kwargs):
+    def _visualize_single_view(self, images, time_step, save_dir, methods):
+        """可视化单视角特征"""
+        B, T, C, H, W = images.shape
+        
+        # 提取特征
+        features_dict = self.extract_patch_features(images)
+        
+        # 获取原始图像
+        original_image = self.denormalize_image(images[0, time_step]).cpu()
+        original_image_np = original_image.permute(1, 2, 0).numpy()
+        
+        # 保存原始图像
+        plt.figure(figsize=(8, 6))
+        plt.imshow(original_image_np)
+        plt.title(f'Original Image (Time Step {time_step})')
+        plt.axis('off')
+        plt.savefig(os.path.join(save_dir, f'original_image_t{time_step}.png'), 
+                   bbox_inches='tight', dpi=150)
+        plt.close()
+        
+        # 可视化DINOv2原始特征
+        if 'dinov2_output' in features_dict['intermediate_features']:
+            dinov2_features = features_dict['intermediate_features']['dinov2_output']
+            # 移除CLS token
+            patch_features = dinov2_features[0, 1:, :]  # [N, 768]
+            
+            # 计算patch维度
+            num_patches = patch_features.shape[0]
+            patch_h = patch_w = int(math.sqrt(num_patches))
+            
+            if patch_h * patch_w != num_patches:
+                aspect_ratio = W / H
+                patch_h = int(math.sqrt(num_patches / aspect_ratio))
+                patch_w = int(num_patches / patch_h)
+                if patch_h * patch_w != num_patches:
+                    patch_h = patch_w = int(math.sqrt(num_patches))
+                    patch_features = patch_features[:patch_h*patch_w, :]
+            
+            for method in methods:
+                heatmap = self.create_attention_heatmap(
+                    patch_features.unsqueeze(0), patch_h, patch_w, method
+                )[0].cpu().numpy()
+                
+                # 上采样热力图到原始图像尺寸
+                heatmap_resized = cv2.resize(heatmap, (W, H), interpolation=cv2.INTER_LINEAR)
+                
+                # 创建叠加图像
+                overlay_image = self.overlay_heatmap_on_image(
+                    original_image_np, heatmap_resized
+                )
+                
+                # 保存可视化结果
+                fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+                
+                axes[0].imshow(original_image_np)
+                axes[0].set_title('Original Image')
+                axes[0].axis('off')
+                
+                im1 = axes[1].imshow(heatmap_resized, cmap='jet')
+                axes[1].set_title(f'DINOv2 Features ({method})')
+                axes[1].axis('off')
+                plt.colorbar(im1, ax=axes[1])
+                
+                axes[2].imshow(overlay_image)
+                axes[2].set_title('Overlay')
+                axes[2].axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f'dinov2_features_{method}_t{time_step}.png'), 
+                           bbox_inches='tight', dpi=150)
+                plt.close()
+        
+        # 可视化适配后的特征
+        if 'adapted_features' in features_dict['intermediate_features']:
+            adapted_features = features_dict['intermediate_features']['adapted_features']
+            
+            # 计算patch维度
+            num_patches = adapted_features.shape[1]
+            patch_h = patch_w = int(math.sqrt(num_patches))
+            
+            if patch_h * patch_w != num_patches:
+                aspect_ratio = W / H
+                patch_h = int(math.sqrt(num_patches / aspect_ratio))
+                patch_w = int(num_patches / patch_h)
+                if patch_h * patch_w != num_patches:
+                    patch_h = patch_w = int(math.sqrt(num_patches))
+            
+            for method in methods:
+                heatmap = self.create_attention_heatmap(
+                    adapted_features, patch_h, patch_w, method
+                )[0].cpu().numpy()
+                
+                # 上采样热力图到原始图像尺寸
+                heatmap_resized = cv2.resize(heatmap, (W, H), interpolation=cv2.INTER_LINEAR)
+                
+                # 创建叠加图像
+                overlay_image = self.overlay_heatmap_on_image(
+                    original_image_np, heatmap_resized
+                )
+                
+                # 保存可视化结果
+                fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+                
+                axes[0].imshow(original_image_np)
+                axes[0].set_title('Original Image')
+                axes[0].axis('off')
+                
+                im1 = axes[1].imshow(heatmap_resized, cmap='jet')
+                axes[1].set_title(f'Adapted Features ({method})')
+                axes[1].axis('off')
+                plt.colorbar(im1, ax=axes[1])
+                
+                axes[2].imshow(overlay_image)
+                axes[2].set_title('Overlay')
+                axes[2].axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f'adapted_features_{method}_t{time_step}.png'), 
+                           bbox_inches='tight', dpi=150)
+                plt.close()
+    
+    def _visualize_dual_view(self, images, time_step, save_dir, methods):
+        """可视化双视角特征"""
+        images_view1, images_view2 = images
+        B, T, C, H, W = images_view1.shape
+        
+        # 提取特征
+        features_dict = self.extract_patch_features(images)
+        
+        # 获取原始图像
+        original_image_view1 = self.denormalize_image(images_view1[0, time_step]).cpu()
+        original_image_view2 = self.denormalize_image(images_view2[0, time_step]).cpu()
+        original_image_view1_np = original_image_view1.permute(1, 2, 0).numpy()
+        original_image_view2_np = original_image_view2.permute(1, 2, 0).numpy()
+        
+        # 保存原始图像
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        axes[0].imshow(original_image_view1_np)
+        axes[0].set_title(f'View 1 - Original Image (Time Step {time_step})')
+        axes[0].axis('off')
+        
+        axes[1].imshow(original_image_view2_np)
+        axes[1].set_title(f'View 2 - Original Image (Time Step {time_step})')
+        axes[1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'original_images_dual_t{time_step}.png'), 
+                   bbox_inches='tight', dpi=150)
+        plt.close()
+        
+        # 可视化各个视角的DINOv2特征
+        for view_idx, (view_name, original_image_np) in enumerate([
+            ('view1', original_image_view1_np), 
+            ('view2', original_image_view2_np)
+        ]):
+            feature_key = f'dinov2_{view_name}_output'
+            if feature_key in features_dict['intermediate_features']:
+                dinov2_features = features_dict['intermediate_features'][feature_key]
+                # 移除CLS token
+                patch_features = dinov2_features[0, 1:, :]  # [N, 768]
+                
+                # 计算patch维度
+                num_patches = patch_features.shape[0]
+                patch_h = patch_w = int(math.sqrt(num_patches))
+                
+                if patch_h * patch_w != num_patches:
+                    aspect_ratio = W / H
+                    patch_h = int(math.sqrt(num_patches / aspect_ratio))
+                    patch_w = int(num_patches / patch_h)
+                    if patch_h * patch_w != num_patches:
+                        patch_h = patch_w = int(math.sqrt(num_patches))
+                        patch_features = patch_features[:patch_h*patch_w, :]
+                
+                for method in methods:
+                    heatmap = self.create_attention_heatmap(
+                        patch_features.unsqueeze(0), patch_h, patch_w, method
+                    )[0].cpu().numpy()
+                    
+                    # 上采样热力图到原始图像尺寸
+                    heatmap_resized = cv2.resize(heatmap, (W, H), interpolation=cv2.INTER_LINEAR)
+                    
+                    # 创建叠加图像
+                    overlay_image = self.overlay_heatmap_on_image(
+                        original_image_np, heatmap_resized
+                    )
+                    
+                    # 保存可视化结果
+                    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+                    
+                    axes[0].imshow(original_image_np)
+                    axes[0].set_title(f'{view_name.title()} - Original Image')
+                    axes[0].axis('off')
+                    
+                    im1 = axes[1].imshow(heatmap_resized, cmap='jet')
+                    axes[1].set_title(f'{view_name.title()} - DINOv2 Features ({method})')
+                    axes[1].axis('off')
+                    plt.colorbar(im1, ax=axes[1])
+                    
+                    axes[2].imshow(overlay_image)
+                    axes[2].set_title(f'{view_name.title()} - Overlay')
+                    axes[2].axis('off')
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(save_dir, f'dinov2_{view_name}_features_{method}_t{time_step}.png'), 
+                               bbox_inches='tight', dpi=150)
+                    plt.close()
+        
+        # 可视化融合后的特征（如果有的话）
+        if 'fused_features' in features_dict['intermediate_features']:
+            # 注意：融合特征的形状可能与原始patch特征不同
+            print("Fused features visualization would require additional processing based on the fusion output format.")
+    
+    def visualize_custom_images(self, 
+                              image_paths,
+                              save_dir='./vla_dinov2_custom_visualizations',
+                              methods=['mean', 'norm']):
         """
-        从图像路径可视化物体特征
+        可视化自定义图像的特征
         
         Args:
-            image_paths: 图像路径列表 (单视角: [path], 双视角: [path1, path2])
-            **kwargs: 传递给visualize_object_features的其他参数
+            image_paths: 图像路径列表
+                        - 单视角: [path1, path2] (两个时间步)
+                        - 双视角: [[view1_path1, view1_path2], [view2_path1, view2_path2]]
+            save_dir: 保存目录
+            methods: 特征聚合方法列表
         """
-        # 加载和预处理图像
-        transform = transforms.Compose([
-            transforms.Resize(self.image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        os.makedirs(save_dir, exist_ok=True)
         
-        if self.use_dual_view:
-            if len(image_paths) != 2:
-                raise ValueError("双视角模式需要提供两个图像路径")
-            
-            images = []
-            for path in image_paths:
-                img = Image.open(path).convert('RGB')
-                img_tensor = transform(img).unsqueeze(0).unsqueeze(0)  # [1, 1, C, H, W]
-                images.append(img_tensor.to(self.device))
+        if self.encoder_type == 'single':
+            # 单视角处理
+            assert len(image_paths) == 2, "Single view requires 2 time steps"
+            images = self._load_custom_images_single(image_paths)
+            self._visualize_single_view(images, 1, save_dir, methods)  # 可视化第二个时间步
         else:
-            if len(image_paths) != 1:
-                raise ValueError("单视角模式只需要一个图像路径")
-            
-            img = Image.open(image_paths[0]).convert('RGB')
-            images = transform(img).unsqueeze(0).unsqueeze(0).to(self.device)  # [1, 1, C, H, W]
+            # 双视角处理
+            assert len(image_paths) == 2 and len(image_paths[0]) == 2, "Dual view requires 2 views with 2 time steps each"
+            images = self._load_custom_images_dual(image_paths)
+            self._visualize_dual_view(images, 1, save_dir, methods)  # 可视化第二个时间步
+    
+    def _load_custom_images_single(self, image_paths):
+        """加载单视角自定义图像"""
+        images_list = []
+        for path in image_paths:
+            image = Image.open(path).convert('RGB')
+            image = image.resize((self.image_size[1], self.image_size[0]))  # (width, height)
+            image_tensor = torch.from_numpy(np.array(image)).float() / 255.0
+            image_tensor = image_tensor.permute(2, 0, 1)  # [C, H, W]
+            # 归一化
+            image_tensor = (image_tensor - self.mean.squeeze()) / self.std.squeeze()
+            images_list.append(image_tensor)
         
-        # 设置保存路径
-        save_path = os.path.join(self.output_dir, "custom_image_object_features.png")
+        images = torch.stack(images_list, dim=0).unsqueeze(0).to(self.device)  # [1, T, C, H, W]
+        return images
+    
+    def _load_custom_images_dual(self, image_paths):
+        """加载双视角自定义图像"""
+        view1_paths, view2_paths = image_paths
         
-        # 可视化
-        self.visualize_object_features(images, save_path=save_path, **kwargs)
+        images_view1 = self._load_custom_images_single(view1_paths)
+        images_view2 = self._load_custom_images_single(view2_paths)
+        
+        return [images_view1, images_view2]
+    
+    def __del__(self):
+        """析构函数，清理钩子"""
+        self.clear_hooks()
 
 
 # 使用示例
 if __name__ == "__main__":
-    # 初始化可视化器
-    visualizer = DINOv2FeatureVisualizer(
+    # 单视角DINOv2可视化
+    print("创建单视角DINOv2可视化器...")
+    single_visualizer = VLADINOv2Visualizer(
+        encoder_type='single',
         model_name="facebook/dinov2-base",
-        dataset_path="c:/DiskD/trae_doc/VLA",
-        device='cuda',
-        use_dual_view=True,
-        image_size=(224, 224)
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # 从数据集可视化
-    visualizer.visualize_from_dataset(
-        sample_idx=0,
-        extraction_methods=['attention', 'clustering', 'pca'],
-        top_k=5,
-        alpha=0.6
+    try:
+        single_visualizer.visualize_features_from_dataset(
+            dataset_path='./james',  # 替换为您的数据集路径
+            sample_idx=0,
+            time_step=1,
+            save_dir='./single_view_visualizations',
+            methods=['mean', 'norm']
+        )
+        print("单视角可视化完成！")
+    except Exception as e:
+        print(f"单视角数据集可视化失败: {e}")
+    
+    # 双视角DINOv2可视化
+    print("\n创建双视角DINOv2可视化器...")
+    dual_visualizer = VLADINOv2Visualizer(
+        encoder_type='dual',
+        model_name="facebook/dinov2-base",
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
-    # 从自定义图像可视化
-    # visualizer.visualize_from_image_paths(
-    #     image_paths=["path/to/image1.jpg", "path/to/image2.jpg"],
-    #     extraction_methods=['attention'],
-    #     top_k=3,
-    #     alpha=0.5
+    # 从数据集可视化
+    try:
+        dual_visualizer.visualize_features_from_dataset(
+            dataset_path='./james',  # 替换为您的数据集路径
+            sample_idx=0,
+            time_step=1,
+            save_dir='./dual_view_visualizations',
+            methods=['mean', 'norm']
+        )
+        print("双视角可视化完成！")
+    except Exception as e:
+        print(f"双视角数据集可视化失败: {e}")
+    
+    # 自定义图像可视化示例
+    # single_visualizer.visualize_custom_images(
+    #     image_paths=['path/to/image1.jpg', 'path/to/image2.jpg'],
+    #     save_dir='./custom_single_visualizations'
+    # )
+    
+    # dual_visualizer.visualize_custom_images(
+    #     image_paths=[
+    #         ['path/to/view1_image1.jpg', 'path/to/view1_image2.jpg'],
+    #         ['path/to/view2_image1.jpg', 'path/to/view2_image2.jpg']
+    #     ],
+    #     save_dir='./custom_dual_visualizations'
     # )
