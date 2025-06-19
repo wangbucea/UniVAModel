@@ -82,10 +82,28 @@ class FeatureHeatmapValidator:
         """注册钩子函数以提取中间特征"""
         def get_activation(name):
             def hook(model, input, output):
-                if isinstance(output, tuple):
-                    self.features[name] = output[0].detach()
-                else:
+                # 处理Hugging Face transformers的输出格式
+                if hasattr(output, 'last_hidden_state'):
+                    # BaseModelOutputWithPooling格式
+                    self.features[name] = output.last_hidden_state.detach()
+                elif hasattr(output, 'hidden_states'):
+                    # 如果有hidden_states属性
+                    self.features[name] = output.hidden_states[-1].detach()
+                elif isinstance(output, tuple):
+                    # 元组格式，取第一个元素
+                    if hasattr(output[0], 'detach'):
+                        self.features[name] = output[0].detach()
+                    else:
+                        # 如果第一个元素也不是tensor，尝试提取last_hidden_state
+                        if hasattr(output[0], 'last_hidden_state'):
+                            self.features[name] = output[0].last_hidden_state.detach()
+                        else:
+                            print(f"Warning: Cannot extract features from {name}, output type: {type(output[0])}")
+                elif hasattr(output, 'detach'):
+                    # 标准tensor格式
                     self.features[name] = output.detach()
+                else:
+                    print(f"Warning: Cannot extract features from {name}, output type: {type(output)}")
             return hook
         
         # 注册DINOv2特征提取钩子
