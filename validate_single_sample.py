@@ -313,7 +313,107 @@ class VLASingleSampleValidator:
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         print(f"\n验证报告已保存到: {output_path}")
-    
+    def _visualize_detection_separately(self, sample, results):
+        """在单独窗口中可视化目标检测结果"""
+        if 'detection' not in results or 'error' in results['detection']:
+            print("警告: 无有效的目标检测结果可视化")
+            return
+        
+        print("\n--- 在独立窗口显示目标检测结果 ---")
+        
+        # 创建独立的检测可视化窗口
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        fig.suptitle(f'目标检测结果 - 样本 {sample["sample_id"]}', fontsize=14)
+        
+        # 获取原始图像（Chest摄像头中间帧）
+        chest_img = sample['chest_images'][2]  # 中间帧
+        # 反归一化图像
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        chest_img_denorm = chest_img * std + mean
+        chest_img_denorm = torch.clamp(chest_img_denorm, 0, 1)
+        
+        # 获取图像尺寸用于反归一化检测框
+        img_height, img_width = chest_img_denorm.shape[1], chest_img_denorm.shape[2]
+        
+        det_results = results['detection']
+        
+        # 左侧：显示预测结果
+        ax1.imshow(chest_img_denorm.permute(1, 2, 0))
+        ax1.set_title(f'预测结果 ({det_results["num_predictions"]}个目标)', fontsize=12)
+        
+        # 绘制预测框（需要反归一化坐标）
+        for i, (box, label, prob) in enumerate(zip(det_results['predicted_boxes'], 
+                                  det_results['predicted_labels'], 
+                                  det_results['predicted_probs'])):
+            # 反归一化坐标：从[0,1]范围转换到像素坐标
+            x1_norm, y1_norm, x2_norm, y2_norm = box
+            x1_pixel = x1_norm * img_width
+            y1_pixel = y1_norm * img_height
+            x2_pixel = x2_norm * img_width
+            y2_pixel = y2_norm * img_height
+            
+            w = x2_pixel - x1_pixel
+            h = y2_pixel - y1_pixel
+            
+            rect = patches.Rectangle((x1_pixel, y1_pixel), w, h, linewidth=2, 
+                                   edgecolor='red', facecolor='none')
+            ax1.add_patch(rect)
+            
+            class_name = self.class_names[label] if label < len(self.class_names) else f"class_{label}"
+            ax1.text(x1_pixel, y1_pixel-5, f'{class_name}: {prob:.2f}', 
+                   color='red', fontsize=10, weight='bold',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+            
+            print(f"  预测 {i+1}: {class_name} ({prob:.3f}) - 像素坐标: [{x1_pixel:.1f}, {y1_pixel:.1f}, {x2_pixel:.1f}, {y2_pixel:.1f}]")
+        
+        ax1.axis('off')
+        
+        # 右侧：显示真实标签
+        ax2.imshow(chest_img_denorm.permute(1, 2, 0))
+        ax2.set_title(f'真实标签 ({det_results["num_ground_truth"]}个目标)', fontsize=12)
+        
+        # 绘制真实框（需要反归一化坐标）
+        for i, (box, label) in enumerate(zip(det_results['ground_truth_boxes'], 
+                            det_results['ground_truth_labels'])):
+            # 反归一化坐标：从[0,1]范围转换到像素坐标
+            x1_norm, y1_norm, x2_norm, y2_norm = box
+            x1_pixel = x1_norm * img_width
+            y1_pixel = y1_norm * img_height
+            x2_pixel = x2_norm * img_width
+            y2_pixel = y2_norm * img_height
+            
+            w = x2_pixel - x1_pixel
+            h = y2_pixel - y1_pixel
+            
+            rect = patches.Rectangle((x1_pixel, y1_pixel), w, h, linewidth=2, 
+                                   edgecolor='green', facecolor='none')
+            ax2.add_patch(rect)
+            
+            class_name = self.class_names[label] if label < len(self.class_names) else f"class_{label}"
+            ax2.text(x1_pixel, y2_pixel+15, f'GT: {class_name}', 
+                   color='green', fontsize=10, weight='bold',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+            
+            print(f"  真实 {i+1}: {class_name} - 像素坐标: [{x1_pixel:.1f}, {y1_pixel:.1f}, {x2_pixel:.1f}, {y2_pixel:.1f}]")
+        
+        ax2.axis('off')
+        
+        # 添加图例
+        from matplotlib.lines import Line2D
+        legend_elements = [Line2D([0], [0], color='red', lw=2, label='预测框'),
+                          Line2D([0], [0], color='green', lw=2, label='真实框')]
+        fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0.02), ncol=2)
+        
+        plt.tight_layout()
+        
+        # 保存检测结果图像
+        detection_save_path = f"detection_results_sample_{sample['sample_id']}_frame_{sample['start_frame']}.png"
+        plt.savefig(detection_save_path, dpi=300, bbox_inches='tight')
+        print(f"目标检测结果已保存到: {detection_save_path}")
+        
+        # 显示窗口
+        plt.show()
     def visualize_results(self, sample_idx=0, save_path=None):
         """可视化验证结果"""
         sample = self.dataset[sample_idx]
